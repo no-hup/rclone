@@ -1,6 +1,8 @@
 package vfs
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -196,6 +198,16 @@ func (fh *WriteFileHandle) Offset() (offset int64) {
 //
 // Must be called with fh.mu held
 func (fh *WriteFileHandle) close() (err error) {
+	return fh.closeWithError(nil)
+}
+
+// closeWithError closes the file handle like close does. If reason is
+// non-nil the streaming upload is failed with reason rather than being
+// ended normally, so a partially written file is discarded instead of
+// being stored as if it were complete.
+//
+// Must be called with fh.mu held
+func (fh *WriteFileHandle) closeWithError(reason error) (err error) {
 	if fh.closed {
 		return ECLOSED
 	}
@@ -211,7 +223,7 @@ func (fh *WriteFileHandle) close() (err error) {
 	if err = fh.openPending(); err != nil {
 		return err
 	}
-	writeCloseErr := fh.pipeWriter.Close()
+	writeCloseErr := fh.pipeWriter.CloseWithError(reason)
 	err = <-fh.result
 	if err == nil {
 		fh.file.setObject(fh.o)
@@ -228,6 +240,25 @@ func (fh *WriteFileHandle) Close() error {
 	fh.mu.Lock()
 	defer fh.mu.Unlock()
 	return fh.close()
+}
+
+// CloseWithError closes the file handle, abandoning the write.
+//
+// The streaming upload to the backend is failed with reason rather than
+// being ended normally, so the partially written file is discarded
+// instead of being stored as if it were complete. A nil reason is the
+// same as Close.
+//
+// It returns ECLOSED if the handle has already been closed.
+func (fh *WriteFileHandle) CloseWithError(reason error) error {
+	// Don't let an EOF-like reason be mistaken for a clean end of stream
+	// by whatever is reading the other end of the pipe.
+	if reason != nil && (errors.Is(reason, io.EOF) || errors.Is(reason, io.ErrUnexpectedEOF)) {
+		reason = fmt.Errorf("write aborted: %v", reason)
+	}
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	return fh.closeWithError(reason)
 }
 
 // Flush is called on each close() of a file descriptor. So if a

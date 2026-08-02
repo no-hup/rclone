@@ -235,6 +235,47 @@ func TestWriteFileHandleWriteAt(t *testing.T) {
 	fstest.CheckListingWithPrecision(t, r.Fremote, []fstest.Item{file1}, []string{}, fs.ModTimeNotSupported)
 }
 
+func TestWriteFileHandleCloseWithError(t *testing.T) {
+	// io.ErrUnexpectedEOF must fail the upload like any other reason.
+	for _, reason := range []error{errors.New("upload interrupted"), io.ErrUnexpectedEOF} {
+		t.Run(reason.Error(), func(t *testing.T) {
+			r, vfs, fh := writeHandleCreate(t)
+
+			// Write some data then abandon the write mid-stream
+			n, err := fh.Write([]byte("hello"))
+			require.NoError(t, err)
+			assert.Equal(t, 5, n)
+
+			err = fh.CloseWithError(reason)
+			require.Error(t, err)
+			assert.ErrorContains(t, err, reason.Error())
+
+			// Check double close
+			assert.Equal(t, ECLOSED, fh.Close())
+
+			if *fstest.RemoteName == "" {
+				_, err = vfs.Stat("file1")
+				assert.Equal(t, ENOENT, err, "The abandoned file must not exist in the VFS or on the remote")
+				fstest.CheckListingWithPrecision(t, r.Fremote, []fstest.Item{}, []string{}, fs.ModTimeNotSupported)
+			}
+		})
+	}
+
+	// CloseWithError with a nil reason behaves like Close and commits the file
+	t.Run("NilReason", func(t *testing.T) {
+		r, vfs := newTestVFS(t)
+		h, err := vfs.OpenFile("file2", os.O_WRONLY|os.O_CREATE, 0777)
+		require.NoError(t, err)
+		fh2, ok := h.(*WriteFileHandle)
+		require.True(t, ok)
+		_, err = fh2.Write([]byte("hello"))
+		require.NoError(t, err)
+		require.NoError(t, fh2.CloseWithError(nil))
+		file2 := fstest.NewItem("file2", "hello", t1)
+		fstest.CheckListingWithPrecision(t, r.Fremote, []fstest.Item{file2}, []string{}, fs.ModTimeNotSupported)
+	})
+}
+
 func TestWriteFileHandleFlush(t *testing.T) {
 	_, vfs, fh := writeHandleCreate(t)
 
