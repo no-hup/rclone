@@ -108,13 +108,20 @@ S3 listings but must be removed manually.
 
 ### Multipart uploads
 
-By default `serve s3` **streams** each multipart upload, in part-number
-order, into a single `PutStream` upload to the underlying remote, so the
-whole file is never buffered in memory - memory use stays bounded by the
-parts in flight. The remote then performs its own internal upload (for
-example its own multipart upload, still with bounded memory). This works
-for any remote that supports `PutStream`, which is nearly all of them,
-including through `crypt`.
+With `--vfs-cache-mode writes` (or `full`), multipart uploads are
+written, in part-number order, to a temporary file in the VFS cache
+which is renamed into place on completion and uploaded by the VFS
+write-back, exactly like a plain object PUT - see [Multipart uploads
+and the VFS cache](#multipart-uploads-and-the-vfs-cache) below.
+
+Otherwise (the default `--vfs-cache-mode off`) `serve s3` **streams**
+each multipart upload, in part-number order, into a single `PutStream`
+upload to the underlying remote, so the whole file is never buffered in
+memory - memory use stays bounded by the parts in flight. The remote
+then performs its own internal upload (for example its own multipart
+upload, still with bounded memory). This works for any remote that
+supports `PutStream`, which is nearly all of them, including through
+`crypt`.
 
 The upload is atomic so the destination object only ever changes on a
 successful completion. A failed or aborted upload never affects any
@@ -176,6 +183,73 @@ also need to support a server-side move or copy.
   (named with a leading `.rclone_multipart_upload_`) may be left behind;
   it is hidden from S3 listings but must be removed manually.
 
+#### Multipart uploads and the VFS cache
+
+With `--vfs-cache-mode writes` (or `full`) multipart uploads do not
+stream to the remote at all. The parts are written, in part-number
+order, to a temporary file in the VFS cache; on completion the file is
+renamed into place and uploaded by the VFS write-back, exactly like a
+plain object PUT. This needs no `PutStream` support from the remote.
+The rename normally happens in the cache before the upload has started,
+but the VFS requires the remote to support a server-side move or copy
+to rename files at all (and uses one if the temporary file has already
+been written back, e.g. with `--vfs-write-back 0`), so remotes without
+either fall back to the streaming or in-memory paths.
+
+Remotes that benefit from `--vfs-cache-mode writes`:
+
+- **Remotes without streaming upload support** - those that must know
+  the file size before the upload starts, such as `onedrive`, `pcloud`,
+  `jottacloud`, `mailru`, `opendrive`, `putio`, `protondrive` and
+  `zoho`. Without the cache, multipart uploads to these fall back to
+  being buffered **in memory** (see [Disabling
+  streaming](#disabling-streaming) below); with it they are buffered on
+  disk in the cache and uploaded with a known size.
+- **Remotes over slow or unreliable links.** A failure in a streamed
+  upload aborts the whole multipart upload and the client must start
+  again from the first part; a failed write-back upload is retried by
+  the VFS (see `--vfs-cache-max-age` and friends) without the client
+  being involved. Ingest from the client also runs at local disk speed
+  rather than being throttled to the remote's pace.
+- **Workloads that read back or overwrite what they just wrote.** The
+  completed object stays in the cache, so subsequent `GET`/`HEAD`
+  requests are served locally, and plain PUTs and multipart uploads to
+  the same key go through the same cache entry so the last write wins
+  regardless of upload style.
+
+The trade-offs of the cache path:
+
+- The whole object lands on local disk, so the cache (`--cache-dir`)
+  needs space for the largest objects in flight; `--vfs-cache-max-size`
+  cannot evict files which are still being uploaded.
+- The `200 OK` for `CompleteMultipartUpload` means the data is safely
+  in the **local cache**, not yet on the remote - the same durability
+  the cache gives plain PUTs. If an acknowledgement must mean the data
+  has reached the remote (for example WAL archiving), use the default
+  `--vfs-cache-mode off`.
+- The upload to the remote only starts on completion, rather than
+  overlapping with the parts arriving, so the data reaches the remote
+  later than with streaming.
+- If `serve s3` is killed part-way through an upload, the temporary
+  file survives in the cache and the VFS cache recovery uploads it to
+  the remote on restart as a temporary object (named with a leading
+  `.rclone_multipart_upload_`); as with the streaming path, it is
+  hidden from S3 listings but must be removed manually.
+
+#### Cleaning up temporary objects
+
+If `serve s3` is killed part-way through an upload it can leave a
+temporary object behind, named with a leading `.rclone_multipart_upload_`
+or `.rclone_put_object_` and hidden from S3 listings. A temporary object
+never holds acknowledged data - uploads whose temporary object survived
+were never confirmed to the client - so old ones are safe to delete:
+
+    rclone delete --min-age 24h --include ".rclone_multipart_upload_*" --include ".rclone_put_object_*" remote:path
+
+The `--min-age` protects uploads which are still in progress: make sure
+it is longer than your longest upload, especially if several `serve s3`
+instances share the same remote.
+
 #### Disabling streaming
 
 If you pass `--disable-multipart-streaming`, or the remote doesn't
@@ -186,7 +260,9 @@ object is written out in one go when the upload completes (the previous
 behaviour). This removes the in-order/contiguous-part restriction above,
 so parts can be uploaded in any order, but **memory use grows with the
 size of the upload**, so it is only suitable for small objects. A one-off
-`NOTICE` is logged the first time this happens.
+`NOTICE` is logged the first time this happens. Consider
+`--vfs-cache-mode writes` instead, which buffers the upload in the VFS
+cache on disk and takes precedence over `--disable-multipart-streaming`.
 
 Alternatively, if the client is an rclone `s3` remote (like the
 `[serves3]` example above), you can set `use_multipart_uploads = false`

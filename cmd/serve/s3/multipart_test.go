@@ -53,6 +53,12 @@ func newMultipartTestServerBacking(t *testing.T, backing string, disableStreamin
 // newMultipartTestServerOpt is like newMultipartTestServerBacking but also
 // applies tweak (if non-nil) to the server Options before starting it.
 func newMultipartTestServerOpt(t *testing.T, backing string, disableStreaming bool, tweak func(*Options)) (*minio.Core, fs.Fs, string) {
+	return newMultipartTestServerVFS(t, backing, disableStreaming, tweak, nil)
+}
+
+// newMultipartTestServerVFS is like newMultipartTestServerOpt but also
+// overrides the VFS options (nil for the defaults).
+func newMultipartTestServerVFS(t *testing.T, backing string, disableStreaming bool, tweak func(*Options), vfsOpt *vfscommon.Options) (*minio.Core, fs.Fs, string) {
 	fstest.Initialise()
 	ctx := context.Background()
 	if backing == "" {
@@ -64,10 +70,13 @@ func newMultipartTestServerOpt(t *testing.T, backing string, disableStreaming bo
 	// process-wide store, so a fixed name would leak objects between tests.
 	bucket := fmt.Sprintf("test-%d", testBackingCounter.Add(1))
 	require.NoError(t, f.Mkdir(ctx, bucket))
+	if vfsOpt == nil {
+		vfsOpt = &vfscommon.Opt
+	}
 	// The VFS is cached per remote (fs.ConfigString), so a shared ":memory:"
 	// server reuses a VFS whose cached root listing predates the bucket just
 	// created; forget it so the new bucket is visible.
-	if root, err := vfs.New(ctx, f, &vfscommon.Opt).Root(); err == nil {
+	if root, err := vfs.New(ctx, f, vfsOpt).Root(); err == nil {
 		root.ForgetAll()
 	}
 
@@ -80,7 +89,7 @@ func newMultipartTestServerOpt(t *testing.T, backing string, disableStreaming bo
 	if tweak != nil {
 		tweak(&opt)
 	}
-	w, err := newServer(ctx, f, &opt, &vfscommon.Opt, &proxy.Opt)
+	w, err := newServer(ctx, f, &opt, vfsOpt, &proxy.Opt)
 	require.NoError(t, err)
 	go func() { _ = w.Serve() }()
 	t.Cleanup(func() { _ = w.Shutdown() })
@@ -490,6 +499,113 @@ func TestMultipartAbortDuringUploadPart(t *testing.T) {
 	up.mu.Lock()
 	assert.Equal(t, int64(0), up.buffered)
 	up.mu.Unlock()
+}
+
+// cacheWritesVFSOpt returns VFS options with --vfs-cache-mode writes and the
+// given write-back delay.
+func cacheWritesVFSOpt(writeBack time.Duration) *vfscommon.Options {
+	vfsOpt := vfscommon.Opt
+	vfsOpt.CacheMode = vfscommon.CacheModeWrites
+	vfsOpt.WriteBack = fs.Duration(writeBack)
+	return &vfsOpt
+}
+
+// waitForContent waits for bucket/object on the backing Fs to hold want
+// (e.g. after the VFS write-back delay).
+func waitForContent(t *testing.T, f fs.Fs, bucket, object string, want []byte) {
+	ctx := context.Background()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if o, err := f.NewObject(ctx, path.Join(bucket, object)); err == nil {
+			if rc, err := o.Open(ctx); err == nil {
+				got, err := io.ReadAll(rc)
+				_ = rc.Close()
+				if err == nil && bytes.Equal(got, want) {
+					return
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("object %s/%s never reached the expected content on the backing remote", bucket, object)
+}
+
+// TestMultipartCacheModeWrites checks that with --vfs-cache-mode writes a
+// multipart upload goes through the VFS cache and is written back to the
+// backing remote, with no temporary object left behind. Also run with
+// --disable-multipart-streaming, which only affects the streaming path - the
+// cache needs no PutStream, so backends without one take this path instead
+// of buffering in memory.
+func TestMultipartCacheModeWrites(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		disableStreaming bool
+	}{
+		{"Streaming", false},
+		{"NoStreaming", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			core, f, bucket := newMultipartTestServerVFS(t, "", tc.disableStreaming, nil, cacheWritesVFSOpt(100*time.Millisecond))
+			const object = "cached.bin"
+			want, err := multipartUploadParts(t, core, bucket, object, []int{120 * 1024, 100 * 1024, 53 * 1024})
+			require.NoError(t, err)
+			waitForContent(t, f, bucket, object, want)
+			requireOnly(t, f, bucket, object)
+		})
+	}
+}
+
+// TestMultipartCacheModeWritesAbort checks that with --vfs-cache-mode writes
+// an aborted upload is discarded from the cache: nothing reaches the backing
+// remote and an existing object at the key survives.
+func TestMultipartCacheModeWritesAbort(t *testing.T) {
+	core, f, bucket := newMultipartTestServerVFS(t, "", false, nil, cacheWritesVFSOpt(100*time.Millisecond))
+	ctx := context.Background()
+	const object = "cached-abort.bin"
+
+	existing := []byte(random.String(100))
+	_, err := core.PutObject(ctx, bucket, object, bytes.NewReader(existing), int64(len(existing)), "", "", minio.PutObjectOptions{})
+	require.NoError(t, err)
+	waitForContent(t, f, bucket, object, existing)
+
+	uploadID, err := core.NewMultipartUpload(ctx, bucket, object, minio.PutObjectOptions{})
+	require.NoError(t, err)
+	data := []byte(random.String(50 * 1024))
+	_, err = core.PutObjectPart(ctx, bucket, object, uploadID, 1, bytes.NewReader(data), int64(len(data)), minio.PutObjectPartOptions{})
+	require.NoError(t, err)
+	require.NoError(t, core.AbortMultipartUpload(ctx, bucket, object, uploadID))
+
+	// Wait out several write-back intervals: the aborted upload must not be
+	// written back, neither over the object nor as a temporary object.
+	time.Sleep(time.Second)
+	assert.Equal(t, existing, readObject(t, f, bucket, object))
+	requireOnly(t, f, bucket, object)
+}
+
+// TestMultipartCacheModeWritesSupersedesPut checks that a multipart upload
+// completed while an earlier PUT to the same key is still in the write-back
+// window ends up with the multipart data: both writes go through the same
+// cache item, so the earlier PUT's write-back cannot land on top of the
+// newer multipart object.
+func TestMultipartCacheModeWritesSupersedesPut(t *testing.T) {
+	core, f, bucket := newMultipartTestServerVFS(t, "", false, nil, cacheWritesVFSOpt(500*time.Millisecond))
+	ctx := context.Background()
+	const object = "supersede.bin"
+
+	// PUT an object; it sits in the cache awaiting write-back.
+	old := []byte(random.String(100))
+	_, err := core.PutObject(ctx, bucket, object, bytes.NewReader(old), int64(len(old)), "", "", minio.PutObjectOptions{})
+	require.NoError(t, err)
+
+	// Immediately replace it with a multipart upload to the same key.
+	want, err := multipartUploadParts(t, core, bucket, object, []int{60 * 1024, 40 * 1024})
+	require.NoError(t, err)
+
+	// After all write-backs settle the multipart data must have won.
+	waitForContent(t, f, bucket, object, want)
+	time.Sleep(time.Second)
+	assert.Equal(t, want, readObject(t, f, bucket, object))
+	requireOnly(t, f, bucket, object)
 }
 
 // TestMultipartOverwrite checks that a completed multipart upload atomically
